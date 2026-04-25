@@ -1,0 +1,10 @@
+django
+djangorestframework
+djangorestframework-simplejwt
+django-cors-headers
+channels[daphne]
+spotipy
+requests
+PyJWT
+python-dotenv
+pillow
