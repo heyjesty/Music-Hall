@@ -2,9 +2,10 @@
 
 import Link from 'next/link';
 import { useRouter } from 'next/navigation';
-import { Music, LogIn, LogOut, User, Disc, Plus } from 'lucide-react';
+import { Music, LogIn, LogOut, Plus } from 'lucide-react';
 import { clearTokens } from '@/lib/auth';
 import { useCurrentUser } from '@/lib/useCurrentUser';
+import Avatar from './Avatar';
 
 export default function Navbar() {
   const router = useRouter();
@@ -28,33 +29,27 @@ export default function Navbar() {
         <div className="flex items-center gap-2 sm:gap-3">
           {loading ? null : user ? (
             <>
-              {user.is_spotify_connected && (
-                <div className="hidden md:flex items-center gap-2 px-3 py-1.5 rounded-full bg-spotify/10 text-spotify border border-spotify/20">
-                  <Disc size={14} className="animate-spin-slow" />
-                  <span className="text-[10px] font-bold uppercase tracking-widest">Spotify connected</span>
-                </div>
-              )}
               <Link
                 href="/rooms/create"
-                className="hidden sm:flex items-center gap-2 px-4 py-2 rounded-full glass-card hover:bg-white/10 transition-colors text-sm font-medium"
+                className="flex items-center gap-2 px-3 sm:px-4 py-2 rounded-full bg-accent/15 text-accent hover:bg-accent hover:text-white transition-colors text-sm font-semibold"
               >
-                <Plus size={16} /> New room
+                <Plus size={16} /> <span className="hidden sm:inline">Create room</span>
               </Link>
               <Link
                 href="/profile"
-                className="flex items-center gap-2 px-3 sm:px-4 py-2 rounded-full glass-card hover:bg-white/10 transition-colors"
-                aria-label="Profile"
+                className="flex items-center gap-2 pl-1.5 pr-1.5 sm:pr-4 py-1.5 rounded-full glass-card hover:bg-white/10 transition-colors"
+                aria-label="Your profile"
               >
-                <User size={16} />
+                <Avatar name={user.username} size={26} />
                 <span className="hidden sm:inline text-sm font-medium max-w-[10rem] truncate">{user.username}</span>
               </Link>
               <button
                 onClick={handleLogout}
-                className="flex items-center gap-2 px-3 sm:px-4 py-2 rounded-full text-gray-300 hover:text-red-400 hover:bg-red-500/10 transition-colors"
+                className="p-2 rounded-full text-gray-400 hover:text-red-400 hover:bg-red-500/10 transition-colors"
                 aria-label="Log out"
+                title="Log out"
               >
-                <LogOut size={16} />
-                <span className="hidden sm:inline text-sm font-medium">Log out</span>
+                <LogOut size={18} />
               </button>
             </>
           ) : (

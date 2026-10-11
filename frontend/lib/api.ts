@@ -55,8 +55,11 @@ export function getErrorMessage(err: unknown, fallback = 'Something went wrong. 
   const first = Object.entries(data)[0];
   if (first) {
     const [field, value] = first;
-    const msg = Array.isArray(value) ? value[0] : value;
-    if (typeof msg === 'string') return field === 'non_field_errors' ? msg : `${field.replace(/_/g, ' ')}: ${msg}`;
+    const msg = (Array.isArray(value) ? value : [value]).filter((v) => typeof v === 'string').join(' ');
+    if (msg) {
+      const label = field.charAt(0).toUpperCase() + field.slice(1).replace(/_/g, ' ');
+      return field === 'non_field_errors' ? msg : `${label}: ${msg}`;
+    }
   }
   return fallback;
 }

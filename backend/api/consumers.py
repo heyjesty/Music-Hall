@@ -3,63 +3,50 @@ import json
 from channels.db import database_sync_to_async
 from channels.generic.websocket import AsyncWebsocketConsumer
 
+from . import playback, presence
 from .models import ChatMessage, Room
 
 MAX_MESSAGE_LENGTH = 1000
 
 
-def clean_track_meta(meta):
-    """Keep only known display fields from client-supplied track metadata."""
-    if not isinstance(meta, dict):
-        return None
-    album_art = str(meta.get('album_art') or '')[:500]
-    try:
-        duration = int(meta.get('duration') or 0)
-    except (TypeError, ValueError):
-        duration = 0
-    return {
-        'title': str(meta.get('title') or '')[:255],
-        'artist': str(meta.get('artist') or '')[:255],
-        'album_art': album_art if album_art.startswith('https://') else None,
-        'duration': duration,
-    }
-
-
 class RoomConsumer(AsyncWebsocketConsumer):
+    """One socket per listener in a room: chat, presence and playback state."""
+
+    joined = False
+
     async def connect(self):
         self.room_id = int(self.scope['url_route']['kwargs']['room_id'])
-        self.room_group_name = f'room_{self.room_id}'
+        self.room_group_name = playback.group_name(self.room_id)
         self.user = self.scope.get('user')
 
-        self.room_admin_id = await self.get_room_admin_id()
-        if self.room_admin_id is None:
+        if not (self.user and self.user.is_authenticated):
+            await self.close(code=4001)
+            return
+        if not await self.room_exists():
             await self.close(code=4004)
             return
 
         await self.channel_layer.group_add(self.room_group_name, self.channel_name)
         await self.accept()
-        await self.broadcast_presence('joining')
+        self.joined = True
+
+        first_connection = presence.join(self.room_id, self.user)
+        await self.send_json(await self.get_state())
+        await self.broadcast_listeners('joined' if first_connection else None)
 
     async def disconnect(self, close_code):
-        if getattr(self, 'room_admin_id', None) is None:
+        if not self.joined:
             return
-        await self.broadcast_presence('leaving')
+        last_connection = presence.leave(self.room_id, self.user)
         await self.channel_layer.group_discard(self.room_group_name, self.channel_name)
+        await self.broadcast_listeners('left' if last_connection else None)
 
-    @property
-    def is_authenticated(self):
-        return bool(self.user and self.user.is_authenticated)
-
-    @property
-    def is_room_admin(self):
-        return self.is_authenticated and self.user.id == self.room_admin_id
-
-    async def broadcast_presence(self, status):
-        await self.channel_layer.group_send(self.room_group_name, {
-            'type': 'presence_message',
-            'status': status,
-            'user_id': self.user.id if self.is_authenticated else None,
-            'user_name': self.user.username if self.is_authenticated else 'Guest',
+    async def broadcast_listeners(self, change):
+        await self.group_event({
+            'type': 'listeners',
+            'listeners': presence.listeners(self.room_id),
+            'change': change,
+            'user_name': self.user.username,
         })
 
     async def receive(self, text_data=None, bytes_data=None):
@@ -71,14 +58,12 @@ class RoomConsumer(AsyncWebsocketConsumer):
         message_type = data.get('type')
 
         if message_type == 'chat_message':
-            # Identity comes from the authenticated connection, never the client payload.
-            if not self.is_authenticated:
-                return
             content = str(data.get('content', '')).strip()[:MAX_MESSAGE_LENGTH]
             if not content:
                 return
             message = await self.save_message(content)
-            await self.channel_layer.group_send(self.room_group_name, {
+            # Identity comes from the authenticated connection, never the payload.
+            await self.group_event({
                 'type': 'chat_message',
                 'id': message.id,
                 'content': content,
@@ -87,74 +72,40 @@ class RoomConsumer(AsyncWebsocketConsumer):
                 'timestamp': message.timestamp.isoformat(),
             })
 
-        elif message_type == 'playback_sync':
-            # Only the room admin drives playback for everyone else.
-            if not self.is_room_admin:
-                return
-            track_id = data.get('track_id')
+        elif message_type == 'track_ended':
             try:
-                timestamp_ms = int(data.get('timestamp_ms') or 0)
+                play_seq = int(data.get('play_seq'))
             except (TypeError, ValueError):
-                timestamp_ms = 0
-            is_playing = bool(data.get('is_playing'))
-            await self.update_room_state(track_id, is_playing, timestamp_ms)
-            await self.channel_layer.group_send(self.room_group_name, {
-                'type': 'playback_sync_broadcast',
-                'track_id': track_id,
-                'timestamp_ms': timestamp_ms,
-                'is_playing': is_playing,
-                'track': clean_track_meta(data.get('track')),
-                'sender_channel_name': self.channel_name,
-            })
+                return
+            await database_sync_to_async(playback.track_ended)(self.room_id, play_seq)
 
-    # Group message handlers
+        elif message_type == 'request_state':
+            await self.send_json(await self.get_state())
 
-    async def chat_message(self, event):
-        await self.send(text_data=json.dumps({
-            'type': 'chat_message',
-            'id': event.get('id'),
-            'content': event['content'],
-            'user_id': event['user_id'],
-            'user_name': event.get('user_name'),
-            'timestamp': event.get('timestamp'),
-        }))
+    async def group_event(self, payload):
+        await self.channel_layer.group_send(self.room_group_name, {'type': 'room_event', 'payload': payload})
 
-    async def playback_sync_broadcast(self, event):
-        if self.channel_name == event.get('sender_channel_name'):
-            return
-        await self.send(text_data=json.dumps({
-            'type': 'playback_sync',
-            'track_id': event['track_id'],
-            'timestamp_ms': event['timestamp_ms'],
-            'is_playing': event['is_playing'],
-            'track': event.get('track'),
-        }))
+    async def room_event(self, event):
+        await self.send_json(event['payload'])
 
-    async def presence_message(self, event):
-        await self.send(text_data=json.dumps({
-            'type': 'presence',
-            'status': event['status'],
-            'user_id': event['user_id'],
-            'user_name': event.get('user_name'),
-        }))
-
-    async def queue_update_broadcast(self, event):
-        await self.send(text_data=json.dumps({'type': 'queue_update'}))
+    async def send_json(self, payload):
+        await self.send(text_data=json.dumps(payload))
 
     # Database helpers
 
     @database_sync_to_async
-    def get_room_admin_id(self):
-        return Room.objects.filter(id=self.room_id).values_list('admin_id', flat=True).first()
+    def room_exists(self):
+        return Room.objects.filter(id=self.room_id).exists()
+
+    @database_sync_to_async
+    def get_state(self):
+        room = Room.objects.select_related('current_track', 'current_added_by').filter(id=self.room_id).first()
+        if room is None:
+            return {'type': 'room_closed'}
+        if playback.advance_if_finished(self.room_id):
+            room.refresh_from_db()
+        return playback.room_state(room)
 
     @database_sync_to_async
     def save_message(self, content):
         return ChatMessage.objects.create(room_id=self.room_id, user=self.user, content=content)
-
-    @database_sync_to_async
-    def update_room_state(self, track_id, is_playing, timestamp_ms):
-        Room.objects.filter(id=self.room_id).update(
-            current_track_id=track_id,
-            is_playing=is_playing,
-            timestamp_ms=timestamp_ms,
-        )

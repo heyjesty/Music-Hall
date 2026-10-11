@@ -18,7 +18,8 @@ class RoomAdmin(admin.ModelAdmin):
 
 @admin.register(Track)
 class TrackAdmin(admin.ModelAdmin):
-    list_display = ('title', 'artist', 'spotify_id')
+    list_display = ('title', 'artist', 'source', 'is_preview')
+    list_filter = ('source',)
     search_fields = ('title', 'artist')
 
 

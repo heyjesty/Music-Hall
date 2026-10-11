@@ -4,7 +4,6 @@ djangorestframework-simplejwt>=5.5
 django-cors-headers>=4.7
 channels[daphne]>=4.2
 channels-redis>=4.2
-spotipy>=2.25
 requests>=2.32
 python-dotenv>=1.1
 whitenoise>=6.9

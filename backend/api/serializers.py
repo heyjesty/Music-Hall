@@ -1,7 +1,7 @@
 from rest_framework import serializers
 
-from .models import (ChatMessage, CustomUser, Invitation, ListeningHistory, Membership, Playlist, Room,
-                     SpotifyToken, Track, UploadedMusic)
+from . import presence
+from .models import ChatMessage, CustomUser, Invitation, ListeningHistory, Membership, Room, Track, UploadedMusic
 
 
 class PublicUserSerializer(serializers.ModelSerializer):
@@ -13,22 +13,10 @@ class PublicUserSerializer(serializers.ModelSerializer):
 
 
 class CustomUserSerializer(serializers.ModelSerializer):
-    is_spotify_connected = serializers.SerializerMethodField()
-
     class Meta:
         model = CustomUser
-        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'profile_photo', 'music_preferences',
-                  'is_spotify_connected')
+        fields = ('id', 'username', 'email', 'first_name', 'last_name', 'profile_photo', 'music_preferences')
         read_only_fields = ('id', 'username')
-
-    def get_is_spotify_connected(self, obj):
-        return SpotifyToken.objects.filter(user=obj).exists()
-
-
-class SpotifyTokenSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = SpotifyToken
-        fields = ('access_token', 'refresh_token', 'expires_at', 'token_type')
 
 
 class UserRegistrationSerializer(serializers.ModelSerializer):
@@ -47,21 +35,39 @@ class UserRegistrationSerializer(serializers.ModelSerializer):
         return CustomUser.objects.create_user(**validated_data)
 
 
+class TrackSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Track
+        fields = ('id', 'source', 'external_id', 'title', 'artist', 'duration', 'album_art', 'stream_url',
+                  'is_preview', 'created_at')
+
+
 class RoomSerializer(serializers.ModelSerializer):
     admin_detail = PublicUserSerializer(source='admin', read_only=True)
     member_count = serializers.SerializerMethodField()
+    listener_count = serializers.SerializerMethodField()
+    now_playing = serializers.SerializerMethodField()
 
     class Meta:
         model = Room
-        fields = ('id', 'name', 'theme', 'description', 'admin', 'admin_detail', 'member_count',
-                  'current_track_id', 'is_playing', 'timestamp_ms', 'last_sync_time', 'created_at')
-        read_only_fields = ('admin', 'current_track_id', 'is_playing', 'timestamp_ms', 'last_sync_time')
+        fields = ('id', 'name', 'theme', 'description', 'admin', 'admin_detail', 'member_count', 'listener_count',
+                  'now_playing', 'is_playing', 'created_at')
+        read_only_fields = ('admin', 'is_playing')
 
     def get_member_count(self, obj):
         count = getattr(obj, 'approved_member_count', None)
         if count is None:
             count = obj.memberships.filter(status='APPROVED').count()
         return count
+
+    def get_listener_count(self, obj):
+        return presence.count(obj.id)
+
+    def get_now_playing(self, obj):
+        track = obj.current_track
+        if not track:
+            return None
+        return {'title': track.title, 'artist': track.artist, 'album_art': track.album_art}
 
 
 class MembershipSerializer(serializers.ModelSerializer):
@@ -73,32 +79,13 @@ class MembershipSerializer(serializers.ModelSerializer):
         read_only_fields = ('user', 'role', 'status')
 
 
-class TrackSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Track
-        fields = ('id', 'title', 'artist', 'duration', 'source_url', 'spotify_id', 'album_art', 'added_by',
-                  'created_at')
-        read_only_fields = ('added_by',)
-
-
-class PlaylistSerializer(serializers.ModelSerializer):
-    track_detail = TrackSerializer(source='track', read_only=True)
-
-    class Meta:
-        model = Playlist
-        fields = ('id', 'room', 'track', 'track_detail', 'approval_status', 'added_at')
-        read_only_fields = ('approval_status',)
-
-
 class ChatMessageSerializer(serializers.ModelSerializer):
-    user_detail = PublicUserSerializer(source='user', read_only=True)
     user_id = serializers.IntegerField(source='user.id', read_only=True)
     user_name = serializers.CharField(source='user.username', read_only=True)
 
     class Meta:
         model = ChatMessage
-        fields = ('id', 'room', 'user', 'user_id', 'user_name', 'user_detail', 'content', 'timestamp')
-        read_only_fields = ('user',)
+        fields = ('id', 'room', 'user_id', 'user_name', 'content', 'timestamp')
 
 
 class InvitationSerializer(serializers.ModelSerializer):

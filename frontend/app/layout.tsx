@@ -19,11 +19,11 @@ export const metadata: Metadata = {
     template: "%s · Music Hall",
   },
   description:
-    "Create a room, queue tracks from Spotify, and listen in sync with friends — with live chat built in.",
+    "Create or join a music room. Everyone inside hears the same song at the same moment and chats along.",
   applicationName: "Music Hall",
   openGraph: {
     title: "Music Hall",
-    description: "Social, synchronized listening rooms powered by Spotify.",
+    description: "Live music rooms: listen together and chat in real time.",
     type: "website",
   },
 };
@@ -48,7 +48,7 @@ export default function RootLayout({
           {children}
         </main>
         <footer className="border-t border-white/5 py-6 text-center text-xs text-gray-500">
-          © {new Date().getFullYear()} Music Hall · Playback powered by Spotify
+          © {new Date().getFullYear()} Music Hall · Music from Audius &amp; Apple Music previews
         </footer>
       </body>
     </html>
