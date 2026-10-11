@@ -1,26 +1,27 @@
-from django.urls import path, include
+from django.http import JsonResponse
+from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenObtainPairView, TokenRefreshView
-from .views import (UserViewSet, RoomViewSet, MembershipViewSet, TrackViewSet,
-                    PlaylistViewSet, ChatMessageViewSet, InvitationViewSet, 
-                    ListeningHistoryViewSet, UploadedMusicViewSet,
-                    SpotifySearchView, RandomRoomView, SpotifyTransferView, SpotifyPlayView,
-                    SpotifyMoodTracksView)
-from .spotify_auth import SpotifyLoginView, SpotifyCallbackView, SpotifyTokenRefreshView
+
+from .spotify_auth import SpotifyCallbackView, SpotifyLoginView, SpotifyTokenRefreshView
+from .views import (ChatMessageViewSet, InvitationViewSet, ListeningHistoryViewSet, MembershipViewSet,
+                    PlaylistViewSet, RandomRoomView, RoomViewSet, SpotifyMoodTracksView, SpotifyPlayView,
+                    SpotifySearchView, SpotifyTransferView, TrackViewSet, UploadedMusicViewSet, UserViewSet)
 
 router = DefaultRouter()
-router.register(r'users', UserViewSet)
-router.register(r'rooms', RoomViewSet)
-router.register(r'memberships', MembershipViewSet)
-router.register(r'tracks', TrackViewSet)
-router.register(r'playlists', PlaylistViewSet)
-router.register(r'messages', ChatMessageViewSet)
-router.register(r'invitations', InvitationViewSet)
-router.register(r'history', ListeningHistoryViewSet)
-router.register(r'uploads', UploadedMusicViewSet)
+router.register(r'users', UserViewSet, basename='user')
+router.register(r'rooms', RoomViewSet, basename='room')
+router.register(r'memberships', MembershipViewSet, basename='membership')
+router.register(r'tracks', TrackViewSet, basename='track')
+router.register(r'playlists', PlaylistViewSet, basename='playlist')
+router.register(r'messages', ChatMessageViewSet, basename='message')
+router.register(r'invitations', InvitationViewSet, basename='invitation')
+router.register(r'history', ListeningHistoryViewSet, basename='history')
+router.register(r'uploads', UploadedMusicViewSet, basename='upload')
 
 urlpatterns = [
     path('', include(router.urls)),
+    path('health/', lambda request: JsonResponse({'status': 'ok'}), name='health'),
     path('auth/login/', TokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('auth/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
     path('spotify/search/', SpotifySearchView.as_view(), name='spotify-search'),

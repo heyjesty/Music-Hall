@@ -3,18 +3,22 @@
 import { useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import api from '@/lib/api';
+import { Loader2 } from 'lucide-react';
+import api, { getErrorMessage } from '@/lib/api';
+import { setTokens } from '@/lib/auth';
+import AuthCard, { FormError } from '@/components/AuthCard';
+
+const FIELDS = [
+  { name: 'username', label: 'Username', type: 'text', autoComplete: 'username', required: true },
+  { name: 'email', label: 'Email', type: 'email', autoComplete: 'email', required: true },
+  { name: 'password', label: 'Password', type: 'password', autoComplete: 'new-password', required: true },
+] as const;
 
 export default function Signup() {
   const router = useRouter();
-  const [formData, setFormData] = useState({
-    username: '',
-    email: '',
-    password: '',
-    first_name: '',
-    last_name: ''
-  });
+  const [formData, setFormData] = useState({ username: '', email: '', password: '', first_name: '', last_name: '' });
   const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
   const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     setFormData({ ...formData, [e.target.name]: e.target.value });
@@ -22,84 +26,52 @@ export default function Signup() {
 
   const handleSignup = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError('');
+    setSubmitting(true);
     try {
       await api.post('users/', formData);
-      router.push('/login');
+      // Sign the new user straight in.
+      const res = await api.post('auth/login/', { username: formData.username, password: formData.password });
+      setTokens(res.data.access, res.data.refresh);
+      router.push('/');
     } catch (err) {
-      setError('Error creating account.');
+      setError(getErrorMessage(err, 'Could not create your account.'));
+      setSubmitting(false);
     }
   };
 
   return (
-    <div className="flex items-center justify-center min-h-[75vh]">
-      <div className="glass-card p-8 rounded-3xl w-full max-w-md">
-        <h2 className="text-3xl font-bold mb-6 text-center text-gradient">Create Account</h2>
-        {error && <p className="text-red-400 text-sm mb-4 text-center">{error}</p>}
-        
-        <form onSubmit={handleSignup} className="space-y-4">
-          <div className="grid grid-cols-2 gap-4">
-            <div>
-              <label className="block text-sm font-medium mb-1 text-gray-300">First Name</label>
-              <input 
-                name="first_name"
-                type="text" 
-                className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-                onChange={handleChange}
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium mb-1 text-gray-300">Last Name</label>
-              <input 
-                name="last_name"
-                type="text" 
-                className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-                onChange={handleChange}
-              />
-            </div>
+    <AuthCard title="Create your account" subtitle="Start a room in under a minute.">
+      <form onSubmit={handleSignup} className="space-y-4">
+        <FormError message={error} />
+        <div className="grid grid-cols-2 gap-4">
+          <div>
+            <label htmlFor="first_name" className="block text-sm font-medium mb-1.5 text-gray-300">First name</label>
+            <input id="first_name" name="first_name" className="input" autoComplete="given-name"
+              value={formData.first_name} onChange={handleChange} />
           </div>
           <div>
-            <label className="block text-sm font-medium mb-1 text-gray-300">Username</label>
-            <input 
-              name="username"
-              type="text" 
-              className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-              onChange={handleChange}
-              required
-            />
+            <label htmlFor="last_name" className="block text-sm font-medium mb-1.5 text-gray-300">Last name</label>
+            <input id="last_name" name="last_name" className="input" autoComplete="family-name"
+              value={formData.last_name} onChange={handleChange} />
           </div>
-          <div>
-            <label className="block text-sm font-medium mb-1 text-gray-300">Email</label>
-            <input 
-              name="email"
-              type="email" 
-              className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-              onChange={handleChange}
-              required
-            />
+        </div>
+        {FIELDS.map((f) => (
+          <div key={f.name}>
+            <label htmlFor={f.name} className="block text-sm font-medium mb-1.5 text-gray-300">{f.label}</label>
+            <input id={f.name} name={f.name} type={f.type} className="input" autoComplete={f.autoComplete}
+              value={formData[f.name]} onChange={handleChange} required={f.required}
+              minLength={f.name === 'password' ? 8 : undefined} />
+            {f.name === 'password' && <p className="text-xs text-gray-500 mt-1.5">At least 8 characters, not entirely numeric.</p>}
           </div>
-          <div>
-            <label className="block text-sm font-medium mb-1 text-gray-300">Password</label>
-            <input 
-              name="password"
-              type="password" 
-              className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-              onChange={handleChange}
-              required
-            />
-          </div>
-          
-          <button 
-            type="submit" 
-            className="w-full py-3 mt-4 rounded-xl font-bold text-white bg-gradient-to-r from-[#ff7e5f] to-[#feb47b] hover:opacity-90 transition-opacity"
-          >
-            Sign Up
-          </button>
-        </form>
-        
-        <p className="mt-6 text-center text-sm text-gray-400">
-          Already have an account? <Link href="/login" className="text-[#ff7e5f] hover:underline">Log in</Link>
+        ))}
+        <button type="submit" disabled={submitting} className="btn-primary w-full !mt-6">
+          {submitting && <Loader2 size={18} className="animate-spin" />} Create account
+        </button>
+        <p className="pt-2 text-center text-sm text-gray-400">
+          Already have an account? <Link href="/login" className="text-accent hover:underline">Sign in</Link>
         </p>
-      </div>
-    </div>
+      </form>
+    </AuthCard>
   );
 }

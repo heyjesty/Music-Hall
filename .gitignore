@@ -3,9 +3,13 @@ __pycache__/
 *.py[cod]
 *$py.class
 venv/
+.venv/
 .env
 db.sqlite3
 media/
+staticfiles/
+.cache
+.cache-*
 
 # Node
 node_modules/
@@ -13,6 +17,7 @@ node_modules/
 dist/
 .vercel
 *.log
+.env*.local
 
 # IDE
 .vscode/

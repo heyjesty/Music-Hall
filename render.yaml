@@ -1,0 +1,38 @@
+# Render Blueprint for the Music Hall backend (Django + Channels over ASGI).
+# Deploy: Render dashboard -> New -> Blueprint -> select this repo.
+# The frontend is deployed separately on Vercel (root directory: frontend).
+services:
+  - type: web
+    name: music-hall-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt && python manage.py collectstatic --noinput
+    startCommand: python manage.py migrate --noinput && daphne -b 0.0.0.0 -p $PORT core.asgi:application
+    healthCheckPath: /api/health/
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: DJANGO_DEBUG
+        value: "false"
+      - key: DJANGO_SECRET_KEY
+        generateValue: true
+      - key: DJANGO_ALLOWED_HOSTS
+        value: .onrender.com
+      - key: DATABASE_URL
+        fromDatabase:
+          name: music-hall-db
+          property: connectionString
+      # Set these in the Render dashboard:
+      - key: FRONTEND_URL
+        sync: false
+      - key: SPOTIPY_CLIENT_ID
+        sync: false
+      - key: SPOTIPY_CLIENT_SECRET
+        sync: false
+      - key: SPOTIPY_REDIRECT_URI
+        sync: false
+
+databases:
+  - name: music-hall-db
+    plan: free

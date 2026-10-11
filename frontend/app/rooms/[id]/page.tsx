@@ -1,617 +1,737 @@
 "use client";
 
-import { useEffect, useState, useRef, useCallback } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
 import { useParams, useRouter } from 'next/navigation';
-import api from '@/lib/api';
-import { loadSpotifySDK, initializeSpotifyPlayer } from '@/lib/spotify';
-import { Send, Users, Play, Pause, SkipForward, SkipBack, Music, Search, Plus, Volume2, Disc, ArrowUp, Trash2, Loader2 } from 'lucide-react';
+import axios from 'axios';
+import {
+  Send, Users, Play, Pause, SkipForward, Music, Search, Plus, Volume2, Disc, ArrowUp, Trash2, Loader2,
+  Crown, Wifi, WifiOff, X,
+} from 'lucide-react';
+import api, { getErrorMessage } from '@/lib/api';
+import { getAccessToken, isLoggedIn } from '@/lib/auth';
+import { WS_URL } from '@/lib/config';
+import {
+  initializeSpotifyPlayer, loadSpotifySDK, type SpotifyPlaybackState, type SpotifyPlayer,
+} from '@/lib/spotify';
+import { connectSpotify } from '@/lib/spotifyConnect';
+import {
+  formatMs, themeLabel, type ChatMessage, type QueueItem, type Room, type SearchTrack, type User,
+} from '@/lib/types';
 
-export default function Room() {
-  const { id } = useParams();
+type ConnectionStatus = 'connecting' | 'open' | 'closed';
+
+interface NowPlaying {
+  spotifyId: string | null;
+  title: string;
+  artist: string;
+  albumArt: string | null;
+  duration: number;
+  position: number;
+  isPlaying: boolean;
+}
+
+interface PlaylistResponse {
+  id: number;
+  track_detail: { spotify_id: string | null; title: string; artist: string; album_art: string | null; duration: number };
+}
+
+interface SyncMessage {
+  track_id: string | null;
+  timestamp_ms: number;
+  is_playing: boolean;
+  track?: { title: string; artist: string; album_art: string | null; duration: number } | null;
+}
+
+type SocketEvent =
+  | ({ type: 'chat_message' } & ChatMessage)
+  | ({ type: 'playback_sync' } & SyncMessage)
+  | { type: 'queue_update' }
+  | { type: 'presence'; status: 'joining' | 'leaving'; user_id: number | null; user_name: string };
+
+const SYNC_DRIFT_MS = 3000;
+const HEARTBEAT_MS = 5000;
+const QUEUE_POLL_MS = 15000;
+
+const toQueueItem = (p: PlaylistResponse): QueueItem => ({
+  playlistId: p.id,
+  spotifyId: p.track_detail.spotify_id,
+  title: p.track_detail.title,
+  artist: p.track_detail.artist,
+  albumArt: p.track_detail.album_art,
+  duration: p.track_detail.duration,
+});
+
+const nowPlayingFromState = (state: SpotifyPlaybackState): NowPlaying | null => {
+  const track = state.track_window.current_track;
+  if (!track) return null;
+  return {
+    spotifyId: track.id,
+    title: track.name,
+    artist: track.artists.map((a) => a.name).join(', '),
+    albumArt: track.album.images[0]?.url ?? null,
+    duration: state.duration,
+    position: state.position,
+    isPlaying: !state.paused,
+  };
+};
+
+export default function RoomPage() {
+  const params = useParams<{ id: string }>();
+  const roomId = Number(params.id);
   const router = useRouter();
-  const [room, setRoom] = useState<any>(null);
-  const [messages, setMessages] = useState<any[]>([]);
+
+  const [room, setRoom] = useState<Room | null>(null);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [notFound, setNotFound] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [newMessage, setNewMessage] = useState('');
-  const [ws, setWs] = useState<WebSocket | null>(null);
-  const [currentUser, setCurrentUser] = useState<any>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  
-  // Spotify State
-  const [player, setPlayer] = useState<any>(null);
-  const [isPlaybackReady, setIsPlaybackReady] = useState(false);
-  const [deviceId, setDeviceId] = useState<string | null>(null);
-  const [playbackState, setPlaybackState] = useState<any>(null);
-  const [spotifyQuery, setSpotifyQuery] = useState('');
-  const [spotifyResults, setSpotifyResults] = useState<any[]>([]);
+  const [queue, setQueue] = useState<QueueItem[]>([]);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchResults, setSearchResults] = useState<SearchTrack[]>([]);
   const [searching, setSearching] = useState(false);
-  const [queue, setQueue] = useState<any[]>([]);
-  const [localVolume, setLocalVolume] = useState(50);
-  const [moodTracks, setMoodTracks] = useState<any[]>([]);
+  const [moodTracks, setMoodTracks] = useState<SearchTrack[]>([]);
+  const [deviceId, setDeviceId] = useState<string | null>(null);
+  const [playerError, setPlayerError] = useState('');
+  const [nowPlaying, setNowPlaying] = useState<NowPlaying | null>(null);
+  const [volume, setVolume] = useState(50);
+  const [connection, setConnection] = useState<ConnectionStatus>('connecting');
+  const [toast, setToast] = useState('');
 
-  // Sync state
-  const lastSyncRef = useRef<number>(0);
-  const wasPlayingRef = useRef<boolean>(false);
-  const currentTrackIdRef = useRef<string | null>(null);
+  // Refs mirror state for use inside long-lived callbacks (WebSocket, SDK listeners).
+  const wsRef = useRef<WebSocket | null>(null);
+  const playerRef = useRef<SpotifyPlayer | null>(null);
+  const deviceIdRef = useRef<string | null>(null);
+  const roomRef = useRef<Room | null>(null);
+  const userRef = useRef<User | null>(null);
+  const queueRef = useRef<QueueItem[]>([]);
+  const pendingSyncRef = useRef<SyncMessage | null>(null);
+  const lastSentRef = useRef<{ trackId: string | null; playing: boolean } | null>(null);
+  const wasPlayingRef = useRef(false);
+  const advancingRef = useRef(false);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
 
-  const playTrack = async (track: any) => {
-    if (!player || !deviceId) return;
+  const isAdmin = !!room && !!currentUser && room.admin === currentUser.id;
+  const isAdminRef = useRef(false);
+  isAdminRef.current = isAdmin;
+  roomRef.current = room;
+  userRef.current = currentUser;
+  queueRef.current = queue;
+
+  const showToast = useCallback((message: string) => {
+    setToast(message);
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(''), 4000);
+    return () => clearTimeout(timer);
+  }, [toast]);
+
+  const fetchQueue = useCallback(async () => {
     try {
-      await api.post('spotify/transfer/', { device_id: deviceId });
-      await api.post('playlists/', { room: room.id, track_id: track.id, title: track.title, artist: track.artist, duration: track.duration, album_art: track.album_art });
-      if (currentUser?.id === room?.admin) {
-        api.post('spotify/play/', { track_id: track.id, device_id: deviceId });
+      const res = await api.get<PlaylistResponse[]>(`playlists/?room=${roomId}`);
+      setQueue(res.data.map(toQueueItem));
+    } catch {
+      // Silent: polling will retry.
+    }
+  }, [roomId]);
+
+  // ---------- Playback helpers ----------
+
+  const playOnDevice = useCallback(async (
+    spotifyId: string,
+    meta?: { title?: string; artist?: string; album_art?: string | null; duration?: number },
+    positionMs = 0,
+  ) => {
+    const device = deviceIdRef.current;
+    if (!device) return false;
+    try {
+      await playerRef.current?.activateElement?.();
+      await api.post('spotify/play/', {
+        track_id: spotifyId, device_id: device, room: roomId, position_ms: Math.round(positionMs), ...meta,
+      });
+      return true;
+    } catch (err) {
+      showToast(getErrorMessage(err, 'Playback failed.'));
+      return false;
+    }
+  }, [roomId, showToast]);
+
+  /** Follower: bring local playback in line with the host. */
+  const applySync = useCallback(async (sync: SyncMessage) => {
+    if (sync.track) {
+      setNowPlaying({
+        spotifyId: sync.track_id,
+        title: sync.track.title,
+        artist: sync.track.artist,
+        albumArt: sync.track.album_art,
+        duration: sync.track.duration,
+        position: sync.timestamp_ms,
+        isPlaying: sync.is_playing,
+      });
+    }
+
+    const player = playerRef.current;
+    if (!player || !deviceIdRef.current) {
+      pendingSyncRef.current = sync;
+      return;
+    }
+    if (!sync.track_id) return;
+
+    const state = await player.getCurrentState();
+    const localId = state?.track_window.current_track?.id;
+    if (!state || localId !== sync.track_id) {
+      if (sync.is_playing) await playOnDevice(sync.track_id, undefined, sync.timestamp_ms);
+      return;
+    }
+    if (Math.abs(state.position - sync.timestamp_ms) > SYNC_DRIFT_MS) await player.seek(sync.timestamp_ms);
+    if (state.paused && sync.is_playing) await player.resume();
+    if (!state.paused && !sync.is_playing) await player.pause();
+  }, [playOnDevice]);
+
+  /** Host: broadcast the current playback state to listeners. */
+  const broadcastState = useCallback((state: SpotifyPlaybackState) => {
+    const ws = wsRef.current;
+    const track = state.track_window.current_track;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !isAdminRef.current || !track) return;
+    lastSentRef.current = { trackId: track.id, playing: !state.paused };
+    ws.send(JSON.stringify({
+      type: 'playback_sync',
+      track_id: track.id,
+      timestamp_ms: state.position,
+      is_playing: !state.paused,
+      track: {
+        title: track.name,
+        artist: track.artists.map((a) => a.name).join(', '),
+        album_art: track.album.images[0]?.url ?? null,
+        duration: state.duration,
+      },
+    }));
+  }, []);
+
+  const playNextInQueue = useCallback(async () => {
+    if (advancingRef.current) return;
+    const next = queueRef.current.find((item) => item.spotifyId);
+    if (!next?.spotifyId) return;
+    advancingRef.current = true;
+    try {
+      const ok = await playOnDevice(next.spotifyId, {
+        title: next.title, artist: next.artist, album_art: next.albumArt, duration: next.duration,
+      });
+      if (ok) {
+        setQueue((prev) => prev.filter((q) => q.playlistId !== next.playlistId));
+        await api.delete(`playlists/${next.playlistId}/`).catch(() => undefined);
       }
-    } catch (err) {
-      console.error("Failed to play track", err);
+    } finally {
+      setTimeout(() => { advancingRef.current = false; }, 1500);
     }
-  };
+  }, [playOnDevice]);
 
-  const updateVolume = (val: number) => {
-    setLocalVolume(val);
-    if (player) player.setVolume(val / 100);
-  };
+  const handlePlayerState = useCallback((state: SpotifyPlaybackState) => {
+    setNowPlaying(nowPlayingFromState(state));
+    if (!isAdminRef.current) return;
 
-  const reorderToTop = async (track: any) => {
-    // Basic reorder: add to front
-    // In a full app we'd have a 'position' field, for MVP we re-add
-    if (currentUser?.id !== room?.admin) return;
-    try {
-      // Implementation depends on how we want to handle reordering 
-      // For now, let's just log it
-      console.log("Reordering track to top:", track.title);
-    } catch (err) {
-      console.error("Reorder failed", err);
+    const trackId = state.track_window.current_track?.id ?? null;
+    const last = lastSentRef.current;
+    if (!last || last.trackId !== trackId || last.playing !== !state.paused) broadcastState(state);
+
+    // Track finished: SDK reports paused at position 0 right after playing.
+    const ended = state.paused && state.position === 0 && wasPlayingRef.current && !state.loading;
+    wasPlayingRef.current = !state.paused;
+    if (ended) playNextInQueue();
+  }, [broadcastState, playNextInQueue]);
+
+  // ---------- Initial load, WebSocket, Spotify player ----------
+
+  useEffect(() => {
+    if (!Number.isFinite(roomId)) {
+      setNotFound(true);
+      return;
     }
-  };
-
-  const fetchQueue = async () => {
-    try {
-      const playlistRes = await api.get('playlists/');
-      setQueue(playlistRes.data.filter((p: any) => p.room === parseInt(id as string)).map((p: any) => ({
-          ...p.track_detail,
-          playlist_id: p.id
-      })));
-    } catch (err) {
-      console.error("Failed to fetch queue", err);
+    if (!isLoggedIn()) {
+      router.replace(`/login?next=/rooms/${roomId}`);
+      return;
     }
-  };
 
-  const removeFromQueue = async (playlistId: number) => {
-    if (currentUser?.id !== room?.admin) return;
-    try {
-      await api.delete(`playlists/${playlistId}/`);
-      fetchQueue();
-    } catch (err) {
-      console.error("Remove failed", err);
-    }
-  };
+    let disposed = false;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let reconnectDelay = 1000;
 
-  const connectSpotify = async () => {
-    try {
-      const res = await api.get('spotify/login/');
-      window.location.href = res.data.url;
-    } catch (err) {
-      console.error("Failed to get Spotify login URL", err);
-    }
-  };
+    const connectSocket = () => {
+      if (disposed) return;
+      setConnection('connecting');
+      const token = getAccessToken();
+      const socket = new WebSocket(`${WS_URL}/ws/room/${roomId}/${token ? `?token=${encodeURIComponent(token)}` : ''}`);
+      wsRef.current = socket;
 
-  const searchSpotify = async (e: React.FormEvent) => {
+      socket.onopen = () => {
+        reconnectDelay = 1000;
+        setConnection('open');
+        lastSentRef.current = null; // re-announce state after reconnecting
+      };
+      socket.onmessage = (event) => {
+        let data: SocketEvent;
+        try {
+          data = JSON.parse(event.data);
+        } catch {
+          return;
+        }
+        if (data.type === 'chat_message') {
+          setMessages((prev) => (data.id && prev.some((m) => m.id === data.id) ? prev : [...prev, data]));
+        } else if (data.type === 'queue_update') {
+          fetchQueue();
+        } else if (data.type === 'playback_sync' && !isAdminRef.current) {
+          applySync(data);
+        } else if (data.type === 'presence' && data.status === 'joining' && isAdminRef.current) {
+          // Bring the newcomer up to speed.
+          lastSentRef.current = null;
+          playerRef.current?.getCurrentState().then((s) => s && broadcastState(s));
+        }
+      };
+      socket.onclose = (event) => {
+        if (wsRef.current === socket) wsRef.current = null;
+        if (disposed) return;
+        setConnection('closed');
+        if (event.code === 4004) return; // room does not exist
+        reconnectTimer = setTimeout(connectSocket, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 15000);
+      };
+    };
+
+    const setupPlayer = async () => {
+      try {
+        await loadSpotifySDK();
+      } catch {
+        setPlayerError('Could not load the Spotify player.');
+        return;
+      }
+      if (disposed) return;
+      playerRef.current = initializeSpotifyPlayer(
+        async () => (await api.get<{ access_token: string }>('spotify/refresh/')).data.access_token,
+        {
+          onReady: (id) => {
+            deviceIdRef.current = id;
+            setDeviceId(id);
+            setPlayerError('');
+            const pending = pendingSyncRef.current;
+            pendingSyncRef.current = null;
+            if (pending && !isAdminRef.current) applySync(pending);
+          },
+          onNotReady: () => {
+            deviceIdRef.current = null;
+            setDeviceId(null);
+          },
+          onStateChange: handlePlayerState,
+          onError: setPlayerError,
+        },
+        volume / 100,
+      );
+    };
+
+    const init = async () => {
+      try {
+        const [userRes, roomRes] = await Promise.all([
+          api.get<User>('users/me/'),
+          api.get<Room>(`rooms/${roomId}/`),
+        ]);
+        if (disposed) return;
+        setCurrentUser(userRes.data);
+        setRoom(roomRes.data);
+
+        const r = roomRes.data;
+        if (r.current_track_id && r.admin !== userRes.data.id) {
+          // Remember where the host was; applied once our player is ready.
+          pendingSyncRef.current = { track_id: r.current_track_id, timestamp_ms: r.timestamp_ms, is_playing: r.is_playing };
+        }
+
+        connectSocket();
+        api.post(`rooms/${roomId}/join/`).catch(() => undefined);
+
+        const [msgRes, moodRes] = await Promise.all([
+          api.get<ChatMessage[]>(`messages/?room=${roomId}`),
+          api.get<SearchTrack[]>(`spotify/mood-tracks/?mood=${r.theme.toLowerCase()}`).catch(() => ({ data: [] as SearchTrack[] })),
+          fetchQueue(),
+        ]);
+        if (disposed) return;
+        setMessages(msgRes.data);
+        setMoodTracks(moodRes.data);
+
+        if (userRes.data.is_spotify_connected) setupPlayer();
+      } catch (err) {
+        const status = axios.isAxiosError(err) ? err.response?.status : undefined;
+        if (status === 404) setNotFound(true);
+        else if (status === 401) router.replace(`/login?next=/rooms/${roomId}`);
+        else showToast(getErrorMessage(err, 'Failed to load the room.'));
+      }
+    };
+
+    init();
+    const queueInterval = setInterval(fetchQueue, QUEUE_POLL_MS);
+
+    return () => {
+      disposed = true;
+      clearInterval(queueInterval);
+      clearTimeout(reconnectTimer);
+      wsRef.current?.close();
+      wsRef.current = null;
+      playerRef.current?.disconnect();
+      playerRef.current = null;
+      deviceIdRef.current = null;
+    };
+    // Run once per room; callbacks read live values via refs.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [roomId]);
+
+  // Host heartbeat so listeners can correct drift.
+  useEffect(() => {
+    if (!isAdmin || !deviceId) return;
+    const interval = setInterval(async () => {
+      const state = await playerRef.current?.getCurrentState();
+      if (state && !state.paused) broadcastState(state);
+    }, HEARTBEAT_MS);
+    return () => clearInterval(interval);
+  }, [isAdmin, deviceId, broadcastState]);
+
+  // Advance the progress bar locally between SDK events.
+  useEffect(() => {
+    if (!nowPlaying?.isPlaying) return;
+    const interval = setInterval(() => {
+      setNowPlaying((np) => (np && np.isPlaying ? { ...np, position: Math.min(np.position + 1000, np.duration) } : np));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [nowPlaying?.isPlaying]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [messages]);
+
+  // ---------- UI actions ----------
+
+  const handleSearch = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!spotifyQuery.trim()) return;
+    const q = searchQuery.trim();
+    if (!q) return;
     setSearching(true);
     try {
-      console.log("Searching for:", spotifyQuery);
-      const res = await api.get(`spotify/search/?q=${encodeURIComponent(spotifyQuery)}`);
-      console.log("Search results:", res.data);
-      setSpotifyResults(res.data);
+      const res = await api.get<SearchTrack[]>('spotify/search/', { params: { q } });
+      setSearchResults(res.data);
     } catch (err) {
-      console.error(err);
+      showToast(getErrorMessage(err, 'Search failed.'));
     } finally {
       setSearching(false);
     }
   };
 
-  const addToQueue = async (track: any) => {
+  const addToQueue = async (track: SearchTrack) => {
     try {
-      await api.post('playlists/', { room: room.id, track: track.id });
-      // Update local queue or wait for next fetch
-      setQueue(prev => [...prev, track]);
+      await api.post('playlists/', {
+        room: roomId, track_id: track.id, title: track.title, artist: track.artist,
+        duration: track.duration, album_art: track.album_art,
+      });
+      await fetchQueue();
+      showToast(`Added “${track.title}” to the queue`);
     } catch (err) {
-      console.error("Failed to add to queue", err);
+      showToast(getErrorMessage(err, 'Could not add to queue.'));
     }
   };
 
-  const syncPlayback = useCallback((state: any) => {
-    if (!ws || !room || currentUser?.id !== room.admin) return;
-    
-    // Only broadcast if there's a significant change to prevent loops
-    const now = Date.now();
-    if (now - lastSyncRef.current < 2000) return;
-    lastSyncRef.current = now;
-
-    ws.send(JSON.stringify({
-      type: 'playback_sync',
-      track_id: state.track_window.current_track.id,
-      timestamp_ms: state.position,
-      is_playing: !state.paused
-    }));
-  }, [ws, room, currentUser]);
-
-  useEffect(() => {
-    async function init() {
-      try {
-        const userRes = await api.get('users/me/');
-        setCurrentUser(userRes.data);
-        
-        const roomRes = await api.get(`rooms/${id}/`);
-        setRoom(roomRes.data);
-        
-        // Load Spotify SDK if connected
-        if (userRes.data.is_spotify_connected) {
-          await loadSpotifySDK();
-          // We need the user's Spotify access token from backend
-          const tokenRes = await api.get('spotify/refresh/'); // This effectively gets a fresh token
-          const token = tokenRes.data.access_token;
-          
-            const spotifyPlayer = initializeSpotifyPlayer(
-            token,
-            (playerInstance) => {
-              playerInstance.addListener('ready', ({ device_id }) => {
-                console.log('Ready with Device ID', device_id);
-                setDeviceId(device_id);
-                api.post('spotify/transfer/', { device_id }).catch(err => console.error("Transfer failed", err));
-              });
-              
-              playerInstance.addListener('not_ready', ({ device_id }) => {
-                console.log('Device ID has gone offline', device_id);
-                setDeviceId(null);
-              });
-
-              playerInstance.addListener('initialization_error', ({ message }) => { console.error(message); });
-              playerInstance.addListener('authentication_error', ({ message }) => { console.error(message); });
-              playerInstance.addListener('account_error', ({ message }) => { 
-                console.error(message);
-                // Potential Premium error
-              });
-
-              setIsPlaybackReady(true);
-            },
-            (state) => {
-              setPlaybackState(state);
-              // If Admin, broadcast state
-              if (userRes.data.id === roomRes.data.admin) {
-                // We'll call syncPlayback via an effect or direct
-              }
-            }
-          );
-          setPlayer(spotifyPlayer);
-        }
-
-        const msgRes = await api.get('messages/');
-        setMessages(msgRes.data.filter((m: any) => m.room === parseInt(id as string)));
-
-        const playlistRes = await api.get('playlists/');
-        setQueue(playlistRes.data.filter((p: any) => p.room === parseInt(id as string)).map((p: any) => p.track_detail));
-
-        const moodRes = await api.get(`spotify/mood-tracks/?mood=${roomRes.data.theme || 'happy'}`);
-        setMoodTracks(moodRes.data);
-
-      } catch (err) {
-        console.error("Initialization failed", err);
-      }
+  const playNow = async (track: SearchTrack) => {
+    if (!deviceId) {
+      showToast('Your Spotify player is not ready yet.');
+      return;
     }
-    
-    init();
-    
-    const fetchQueue = async () => {
-      try {
-        const playlistRes = await api.get('playlists/');
-        setQueue(playlistRes.data.filter((p: any) => p.room === parseInt(id as string)).map((p: any) => p.track_detail));
-      } catch (err) {
-        console.error("Failed to fetch queue", err);
-      }
-    };
-    
-    // Periodically fetch queue as fallback
-    const queueInterval = setInterval(fetchQueue, 10000);
-
-    const socket = new WebSocket(`ws://localhost:8000/ws/room/${id}/`);
-    setWs(socket);
-
-    socket.onmessage = (event) => {
-      const data = JSON.parse(event.data);
-      if (data.type === 'chat_message') {
-        setMessages(prev => [...prev, data]);
-      } else if (data.type === 'queue_update') {
-        fetchQueue();
-      } else if (data.type === 'playback_sync') {
-        if (currentUser?.id !== room?.admin && player) {
-          handleRemoteSync(data);
-        }
-      }
-    };
-    
-    const handleRemoteSync = async (data: any) => {
-      // Sync logic for followers
-      if (!player) return;
-      const state = await player.getCurrentState();
-      if (!state || state.track_window.current_track.id !== data.track_id) {
-        // Play the track if different
-        api.post('spotify/play/', { track_id: data.track_id, device_id: deviceId });
-      }
-      // Seek if difference > 3s
-      if (state && Math.abs(state.position - data.timestamp_ms) > 3000) {
-        player.seek(data.timestamp_ms);
-      }
-      // Pause/Play
-      if (state && state.paused === data.is_playing) {
-        data.is_playing ? player.resume() : player.pause();
-      }
-    };
-
-    return () => {
-      socket.close();
-      if (player) player.disconnect();
-      clearInterval(queueInterval);
-    };
-  }, [id]);
-
-  const handleRemoteSync = (data: any) => {
-    // If different track, play it
-    // If different pause state, toggle
-    // If significantly different time, seek
-    // This is complex logic, for MVP we focus on basic play/pause/track change
+    await playOnDevice(track.id, {
+      title: track.title, artist: track.artist, album_art: track.album_art, duration: track.duration,
+    });
   };
 
-  const skipToNext = () => {
-    if (currentUser?.id === room?.admin) {
-      handleNextSong();
-    }
-  };
-
-  const handleNextSong = async () => {
-    if (queue.length === 0) return;
-    const nextTrack = queue[0];
+  const moveToTop = async (item: QueueItem) => {
     try {
-      // Logic to play next track and remove it from queue
-      await api.post('spotify/play/', { track_id: nextTrack.id, device_id: deviceId });
-      // Remove from backend playlist (not fully implemented, usually we'd delete it)
-      // For now we slice it locally to trigger transition
-      setQueue(prev => prev.slice(1));
+      await api.post(`playlists/${item.playlistId}/move_to_top/`);
+      await fetchQueue();
     } catch (err) {
-      console.error("Auto play failed", err);
+      showToast(getErrorMessage(err, 'Could not reorder the queue.'));
     }
   };
 
-  useEffect(() => {
-    if (playbackState && room && currentUser?.id === room.admin) {
-      syncPlayback(playbackState);
-      
-      const isEnd = playbackState.position === 0 && 
-                    playbackState.paused && 
-                    wasPlayingRef.current && 
-                    !playbackState.loading;
-      
-      if (isEnd) {
-        console.log("Song ended, moving to next...");
-        handleNextSong();
-      }
-      
-      wasPlayingRef.current = !playbackState.paused;
-      currentTrackIdRef.current = playbackState.track_window?.current_track?.id || null;
+  const removeFromQueue = async (item: QueueItem) => {
+    setQueue((prev) => prev.filter((q) => q.playlistId !== item.playlistId));
+    try {
+      await api.delete(`playlists/${item.playlistId}/`);
+    } catch (err) {
+      showToast(getErrorMessage(err, 'Could not remove the track.'));
+      fetchQueue();
     }
-  }, [playbackState, syncPlayback, room, currentUser]);
+  };
 
-  const togglePlayback = () => {
+  const togglePlayback = async () => {
+    const player = playerRef.current;
     if (!player) return;
+    await player.activateElement?.();
+    if (!nowPlaying?.spotifyId && queue.length) {
+      playNextInQueue();
+      return;
+    }
     player.togglePlay();
   };
 
-  if (!room) return <div className="flex items-center justify-center min-h-screen bg-[#0a0a0c]"><div className="animate-spin rounded-full h-12 w-12 border-b-2 border-[#ff7e5f]"></div></div>;
+  const updateVolume = (value: number) => {
+    setVolume(value);
+    playerRef.current?.setVolume(value / 100);
+  };
+
+  const sendMessage = (e: React.FormEvent) => {
+    e.preventDefault();
+    const content = newMessage.trim();
+    const ws = wsRef.current;
+    if (!content || !ws || ws.readyState !== WebSocket.OPEN) return;
+    ws.send(JSON.stringify({ type: 'chat_message', content }));
+    setNewMessage('');
+  };
+
+  const handleConnectSpotify = async () => {
+    try {
+      await connectSpotify(`/rooms/${roomId}`);
+    } catch (err) {
+      showToast(getErrorMessage(err, 'Could not start Spotify sign-in.'));
+    }
+  };
+
+  // ---------- Render ----------
+
+  if (notFound) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-[60vh] text-center">
+        <Disc size={48} className="text-gray-600 mb-4" />
+        <h1 className="text-2xl font-bold mb-2">Room not found</h1>
+        <p className="text-gray-400 mb-6">It may have been closed by its host.</p>
+        <Link href="/" className="btn-primary">Browse rooms</Link>
+      </div>
+    );
+  }
+
+  if (!room || !currentUser) {
+    return <div className="flex items-center justify-center min-h-[60vh]"><Loader2 size={40} className="animate-spin text-accent" /></div>;
+  }
+
+  const canControl = isAdmin && !!deviceId;
+  const showDiscovery = !searchQuery && searchResults.length === 0;
+  const tracksToShow = showDiscovery ? moodTracks : searchResults;
 
   return (
-    <div className="flex flex-col lg:flex-row gap-6 p-4 lg:p-8 h-screen bg-[#070708] text-white">
-      
-      {/* Sidebar: Search & Queue */}
-      <div className="w-full lg:w-80 flex flex-col gap-6 flex-shrink-0">
-        
-        {/* Spotify Connection */}
-        {!currentUser?.is_spotify_connected && (
-          <div className="glass-card p-6 rounded-3xl bg-gradient-to-br from-[#1DB954]/20 to-black/40 border border-[#1DB954]/30">
-            <h3 className="text-sm font-bold text-[#1DB954] mb-2 uppercase tracking-widest">Premium Required</h3>
-            <p className="text-xs text-gray-400 mb-4">Connect Spotify Premium to listen and sync with the room.</p>
-            <button 
-              onClick={connectSpotify}
-              className="w-full bg-[#1DB954] hover:bg-[#1ed760] text-black font-bold py-3 rounded-full flex items-center justify-center gap-2 transition-all transform hover:scale-105"
-            >
+    <div className="grid grid-cols-1 lg:grid-cols-[20rem_minmax(0,1fr)] gap-6">
+      {/* Sidebar */}
+      <aside className="flex flex-col gap-6 order-2 lg:order-1 min-w-0">
+        {!currentUser.is_spotify_connected && (
+          <div className="glass-card p-6 rounded-3xl bg-gradient-to-br from-spotify/15 to-transparent !border-spotify/30">
+            <h3 className="text-sm font-bold text-spotify mb-2 uppercase tracking-widest">Listen along</h3>
+            <p className="text-xs text-gray-400 mb-4">Connect Spotify Premium to hear the room in sync. You can still chat and add songs without it.</p>
+            <button onClick={handleConnectSpotify}
+              className="w-full bg-spotify hover:bg-[#1ed760] text-black font-bold py-3 rounded-full flex items-center justify-center gap-2 transition-colors">
               <Music size={16} /> Connect Spotify
             </button>
           </div>
         )}
 
-        {/* Discovery/Search */}
-        <div className="glass-card flex-1 min-h-0 flex flex-col rounded-3xl">
+        <section className="glass-card flex flex-col rounded-3xl h-[28rem]">
           <div className="p-4 border-b border-white/5">
-            <h2 className="text-lg font-bold flex items-center gap-2">
-              <Music size={12} className="text-[#ff7e5f]" /> Find Music
-            </h2>
-          </div>
-          <div className="p-4">
-            <form onSubmit={searchSpotify} className="relative">
-              <input 
-                type="text" 
-                className="w-full bg-black/40 border border-white/10 rounded-xl pl-4 pr-10 py-2.5 text-sm focus:ring-2 focus:ring-[#ff7e5f] outline-none"
-                placeholder="Artists, songs..."
-                value={spotifyQuery}
-                onChange={(e) => setSpotifyQuery(e.target.value)}
-              />
-              <button type="submit" className="absolute right-3 top-2.5 text-gray-500 hover:text-white">
-                <Search size={18} />
+            <form onSubmit={handleSearch} className="relative">
+              <input type="search" className="input !py-2.5 !pr-10 text-sm" placeholder="Search songs or artists"
+                value={searchQuery} aria-label="Search Spotify"
+                onChange={(e) => { setSearchQuery(e.target.value); if (!e.target.value) setSearchResults([]); }} />
+              <button type="submit" className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-white" aria-label="Search">
+                {searching ? <Loader2 size={18} className="animate-spin" /> : <Search size={18} />}
               </button>
             </form>
           </div>
-          
-          <div className="flex-1 overflow-y-auto p-4 pt-0 space-y-4 custom-scrollbar">
-            {/* Mood Recommendations */}
-            {moodTracks.length > 0 && !spotifyQuery && (
-              <div className="mb-6">
-                <h3 className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-3 px-2">Mood Picks ({room.theme})</h3>
-                <div className="space-y-3">
-                  {moodTracks.map(track => (
-                    <div key={track.id} className="flex items-center gap-3 p-2 rounded-xl hover:bg-white/5 transition-colors group">
-                      <img src={track.album_art} className="w-10 h-10 rounded-lg shadow-lg" alt={track.title} />
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <p className="text-sm font-bold truncate">{track.title}</p>
-                          {track.id.startsWith('mock') && <span className="text-[8px] bg-white/10 px-1 py-0.5 rounded text-gray-500">SIMULATED</span>}
-                        </div>
-                        <p className="text-xs text-gray-500 truncate">{track.artist}</p>
-                      </div>
-                      <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-all">
-                        <button onClick={() => playTrack(track)} className="p-2 bg-[#1DB954] rounded-full hover:bg-[#1ed760]"><Play size={10} fill="currentColor" /></button>
-                        <button onClick={() => addToQueue(track)} className="p-2 bg-[#ff7e5f] rounded-full hover:bg-[#feb47b]"><Plus size={10} /></button>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              </div>
+          <div className="flex-1 overflow-y-auto p-3 custom-scrollbar">
+            <h3 className="text-[10px] font-bold text-gray-500 uppercase tracking-widest mb-2 px-2">
+              {showDiscovery ? `${themeLabel(room.theme)} picks` : 'Results'}
+            </h3>
+            {tracksToShow.length === 0 && !searching && (
+              <p className="text-xs text-gray-500 px-2 py-4">{showDiscovery ? 'No suggestions right now.' : 'No tracks found.'}</p>
             )}
-
-            {/* Search Results */}
-            {spotifyResults.map(track => (
-              <div key={track.id} className="flex items-center gap-3 p-2 rounded-xl hover:bg-white/5 transition-colors group">
-                <img src={track.album_art} className="w-10 h-10 rounded-lg shadow-lg" alt={track.title} />
-                <div className="flex-1 min-w-0">
-                  <div className="flex items-center gap-2">
-                    <p className="text-sm font-bold truncate">{track.title}</p>
-                    {track.id.startsWith('mock') && <span className="text-[8px] bg-white/10 px-1 py-0.5 rounded text-gray-500">SIMULATED</span>}
+            <ul className="space-y-1">
+              {tracksToShow.map((track) => (
+                <li key={track.id} className="flex items-center gap-3 p-2 rounded-xl hover:bg-white/5 transition-colors group">
+                  {track.album_art ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img src={track.album_art} className="w-10 h-10 rounded-lg object-cover" alt="" />
+                  ) : <div className="w-10 h-10 rounded-lg bg-white/5" />}
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold truncate">{track.title}</p>
+                    <p className="text-xs text-gray-500 truncate">{track.artist}</p>
                   </div>
-                  <p className="text-xs text-gray-500 truncate">{track.artist}</p>
-                </div>
-                <div className="flex gap-1 opacity-0 group-hover:opacity-100 transition-all">
-                  <button 
-                    onClick={() => playTrack(track)}
-                    className="p-2 bg-[#1DB954] rounded-full hover:bg-[#1ed760] transition-all"
-                    title="Play Now"
-                  >
-                    <Play size={12} fill="currentColor" />
-                  </button>
-                  <button 
-                    onClick={() => addToQueue(track)}
-                    className="p-2 bg-[#ff7e5f] rounded-full hover:bg-[#feb47b] transition-all"
-                    title="Add to Queue"
-                  >
-                    <Plus size={12} />
-                  </button>
-                </div>
-              </div>
-            ))}
+                  <div className="flex gap-1 lg:opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                    {canControl && (
+                      <button onClick={() => playNow(track)} className="p-2 bg-spotify text-black rounded-full hover:bg-[#1ed760]" title="Play now" aria-label={`Play ${track.title} now`}>
+                        <Play size={12} fill="currentColor" />
+                      </button>
+                    )}
+                    <button onClick={() => addToQueue(track)} className="p-2 bg-accent rounded-full hover:bg-accent-2" title="Add to queue" aria-label={`Add ${track.title} to queue`}>
+                      <Plus size={12} />
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
           </div>
-        </div>
+        </section>
 
-        {/* Queue */}
-        <div className="glass-card h-64 flex flex-col rounded-3xl">
+        <section className="glass-card flex flex-col rounded-3xl h-72">
           <div className="p-4 border-b border-white/5 flex justify-between items-center">
-            <h2 className="text-sm font-bold uppercase tracking-widest text-gray-500">Up Next</h2>
+            <h2 className="text-sm font-bold uppercase tracking-widest text-gray-400">Up next</h2>
             <span className="text-xs bg-white/5 px-2 py-0.5 rounded-full text-gray-400">{queue.length}</span>
           </div>
-          <div className="flex-1 overflow-y-auto p-4 space-y-3 custom-scrollbar text-xs">
+          <ol className="flex-1 overflow-y-auto p-3 space-y-1 custom-scrollbar">
+            {queue.length === 0 && <li className="text-xs text-gray-500 px-2 py-4">The queue is empty. Add a song!</li>}
             {queue.map((item, i) => (
-              <div key={i} className="flex items-center gap-3 group">
-                <span className="text-gray-600 w-4">{i + 1}</span>
-                <span className="flex-1 truncate font-medium">{item.title}</span>
-                <div className="flex gap-2 opacity-0 group-hover:opacity-100 transition-all">
-                  {currentUser?.id === room?.admin && (
-                    <>
-                      <button 
-                        onClick={() => reorderToTop(item)}
-                        className="p-2 text-gray-400 hover:text-[#ff7e5f] hover:bg-white/5 rounded-full transition-all"
-                        title="Move to Top"
-                      >
-                        <ArrowUp size={16} />
-                      </button>
-                      <button 
-                        onClick={() => removeFromQueue(item.id)}
-                        className="p-2 text-gray-400 hover:text-red-500 hover:bg-white/5 rounded-full transition-all"
-                        title="Remove from Queue"
-                      >
-                        <Trash2 size={16} />
-                      </button>
-                    </>
-                  )}
+              <li key={item.playlistId} className="flex items-center gap-3 p-2 rounded-xl hover:bg-white/5 group">
+                <span className="text-xs text-gray-600 w-4 text-right">{i + 1}</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium truncate">{item.title}</p>
+                  <p className="text-xs text-gray-500 truncate">{item.artist}</p>
                 </div>
-              </div>
+                {isAdmin && (
+                  <div className="flex gap-1 lg:opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity">
+                    {i > 0 && (
+                      <button onClick={() => moveToTop(item)} className="p-1.5 text-gray-400 hover:text-accent rounded-full" title="Move to top" aria-label="Move to top">
+                        <ArrowUp size={14} />
+                      </button>
+                    )}
+                    <button onClick={() => removeFromQueue(item)} className="p-1.5 text-gray-400 hover:text-red-400 rounded-full" title="Remove" aria-label="Remove from queue">
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                )}
+              </li>
             ))}
-          </div>
-        </div>
-      </div>
+          </ol>
+        </section>
+      </aside>
 
-      {/* Main Player & Chat */}
-      <div className="flex-1 flex flex-col gap-6 min-w-0">
-        
-        {/* Player Section */}
-        <div className="glass-card p-8 rounded-[2rem] relative overflow-hidden group">
-          <div className="absolute inset-0 bg-gradient-to-br from-[#ff7e5f]/10 to-transparent opacity-50 group-hover:opacity-70 transition-opacity" />
-          
-          <div className="relative z-10 flex flex-col md:flex-row items-center gap-10">
-            <div className="relative group/art shrink-0">
-              <div className="absolute -inset-4 bg-gradient-to-tr from-[#ff7e5f] to-[#feb47b] rounded-[2.5rem] blur-2xl opacity-20 group-hover/art:opacity-40 transition-opacity animate-pulse" />
-              {playbackState?.track_window?.current_track?.album?.images[0]?.url ? (
-                <img 
-                  src={playbackState.track_window.current_track.album.images[0].url} 
-                  className={`w-64 h-64 rounded-[2rem] object-cover shadow-2xl relative z-10 transition-transform duration-700 ${!playbackState.paused ? 'scale-105 rotate-3' : 'scale-100'}`}
-                  alt="Current Track"
-                />
+      {/* Player + chat */}
+      <div className="flex flex-col gap-6 order-1 lg:order-2 min-w-0">
+        <section className="glass-card p-6 sm:p-8 rounded-[2rem] relative overflow-hidden">
+          <div className="absolute inset-0 bg-gradient-to-br from-accent/10 to-transparent pointer-events-none" />
+          <div className="relative flex flex-col md:flex-row items-center gap-8">
+            <div className="relative shrink-0">
+              <div className="absolute -inset-4 bg-gradient-to-tr from-accent to-accent-2 rounded-[2.5rem] blur-2xl opacity-20" />
+              {nowPlaying?.albumArt ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img src={nowPlaying.albumArt} alt=""
+                  className={`w-48 h-48 sm:w-56 sm:h-56 rounded-[2rem] object-cover shadow-2xl relative transition-transform duration-700 ${nowPlaying.isPlaying ? 'scale-105' : ''}`} />
               ) : (
-                <div className="w-64 h-64 rounded-[2rem] bg-black/40 flex items-center justify-center relative z-10 border border-white/10">
-                  <Music size={80} className="text-gray-700" />
+                <div className="w-48 h-48 sm:w-56 sm:h-56 rounded-[2rem] bg-black/40 flex items-center justify-center relative border border-white/10">
+                  <Music size={64} className="text-gray-700" />
                 </div>
               )}
             </div>
 
-            <div className="flex-1 text-center md:text-left min-w-0">
-              <div className="flex flex-wrap items-center justify-center md:justify-start gap-4 mb-4">
-                <span className="px-4 py-1 bg-white/5 text-[10px] font-bold uppercase tracking-[0.2em] rounded-full text-[#ff7e5f] border border-[#ff7e5f]/20">
-                  {room.theme} Session
+            <div className="flex-1 text-center md:text-left min-w-0 w-full">
+              <div className="flex flex-wrap items-center justify-center md:justify-start gap-3 mb-4">
+                <span className="px-3 py-1 bg-white/5 text-[10px] font-bold uppercase tracking-[0.2em] rounded-full text-accent border border-accent/20">
+                  {room.name}
                 </span>
-                <div className="flex items-center gap-1 text-[10px] text-gray-500">
-                  <Users size={12} /> {room.memberships?.length || 1} Listening
-                </div>
-                {!deviceId && currentUser?.is_spotify_connected && (
-                  <span className="text-[10px] text-yellow-500 font-bold animate-pulse">
-                    ● Connect Spotify Player...
-                  </span>
-                )}
+                <span className="flex items-center gap-1 text-xs text-gray-400"><Users size={12} /> {room.member_count}</span>
+                <span className="flex items-center gap-1 text-xs text-gray-400"><Crown size={12} /> @{room.admin_detail?.username}</span>
+                <span className={`flex items-center gap-1 text-xs ${connection === 'open' ? 'text-spotify' : 'text-yellow-500'}`}>
+                  {connection === 'open' ? <Wifi size={12} /> : <WifiOff size={12} />}
+                  {connection === 'open' ? 'Live' : connection === 'connecting' ? 'Connecting…' : 'Reconnecting…'}
+                </span>
               </div>
 
-              <h1 className="text-5xl font-black mb-2 tracking-tight truncate">
-                {playbackState?.track_window?.current_track?.name || room.name}
+              <h1 className="text-3xl sm:text-5xl font-black mb-2 tracking-tight truncate">
+                {nowPlaying?.title || 'Nothing playing yet'}
               </h1>
-              <p className="text-xl text-gray-400 font-medium truncate mb-8">
-                {playbackState?.track_window?.current_track?.artists[0]?.name || room.description}
+              <p className="text-lg text-gray-400 font-medium truncate mb-6">
+                {nowPlaying?.artist || (isAdmin ? 'Pick a song or press play to start the queue.' : 'Waiting for the host to press play.')}
               </p>
 
-              {/* Progress */}
-              <div className="mb-8 max-w-xl mx-auto md:mx-0">
+              <div className="mb-6 max-w-xl mx-auto md:mx-0">
                 <div className="h-1.5 w-full bg-white/10 rounded-full overflow-hidden">
-                  <div 
-                    className="h-full bg-gradient-to-r from-[#ff7e5f] to-[#feb47b] transition-all duration-1000" 
-                    style={{ width: `${(playbackState?.position / playbackState?.duration) * 100 || 0}%` }}
-                  />
+                  <div className="h-full bg-gradient-to-r from-accent to-accent-2 transition-[width] duration-1000 ease-linear"
+                    style={{ width: `${nowPlaying?.duration ? (nowPlaying.position / nowPlaying.duration) * 100 : 0}%` }} />
                 </div>
-                <div className="flex justify-between mt-2 text-[10px] font-mono text-gray-500 uppercase tracking-widest">
-                  <span>{Math.floor((playbackState?.position || 0) / 60000)}:{String(Math.floor(((playbackState?.position || 0) % 60000) / 1000)).padStart(2, '0')}</span>
-                  <span>{Math.floor((playbackState?.duration || 0) / 60000)}:{String(Math.floor(((playbackState?.duration || 0) % 60000) / 1000)).padStart(2, '0')}</span>
+                <div className="flex justify-between mt-2 text-[10px] font-mono text-gray-500">
+                  <span>{formatMs(nowPlaying?.position ?? 0)}</span>
+                  <span>{formatMs(nowPlaying?.duration ?? 0)}</span>
                 </div>
               </div>
 
-              {/* Controls */}
               <div className="flex items-center justify-center md:justify-start gap-6">
-                <button className="text-gray-400 hover:text-white transition-colors">
-                  <SkipBack size={24} />
+                <button onClick={togglePlayback} disabled={!canControl}
+                  title={isAdmin ? undefined : 'Only the host controls playback'}
+                  aria-label={nowPlaying?.isPlaying ? 'Pause' : 'Play'}
+                  className={`w-16 h-16 rounded-full flex items-center justify-center transition-all shadow-xl ${
+                    canControl ? 'bg-white text-black hover:scale-110' : 'bg-white/10 text-gray-600 cursor-not-allowed'
+                  }`}>
+                  {nowPlaying?.isPlaying ? <Pause size={28} fill="currentColor" /> : <Play size={28} fill="currentColor" className="translate-x-0.5" />}
                 </button>
-                <div className="relative">
-                  <button 
-                    onClick={togglePlayback}
-                    disabled={!deviceId}
-                    className={`w-16 h-16 rounded-full flex items-center justify-center transition-all shadow-xl ${
-                      deviceId ? 'bg-white text-black hover:scale-110' : 'bg-white/10 text-gray-600 cursor-not-allowed'
-                    }`}
-                  >
-                    {playbackState?.paused ? <Play size={28} fill="currentColor" className="translate-x-0.5" /> : <Pause size={28} fill="currentColor" />}
-                  </button>
-                  {!deviceId && currentUser?.is_spotify_connected && (
-                    <div className="absolute -bottom-10 left-1/2 -translate-x-1/2 w-48 text-center text-[9px] text-yellow-500 uppercase tracking-tighter">
-                      Open Spotify app to activate player
-                    </div>
-                  )}
-                </div>
-                <button 
-                  onClick={skipToNext}
-                  className="text-gray-400 hover:text-white transition-colors"
-                >
+                <button onClick={playNextInQueue} disabled={!canControl || queue.length === 0}
+                  className="text-gray-400 hover:text-white transition-colors disabled:opacity-30 disabled:cursor-not-allowed" aria-label="Skip to next">
                   <SkipForward size={24} />
                 </button>
-                <div className="hidden md:flex items-center gap-3 ml-4 pl-6 border-l border-white/10 text-gray-500">
+                <div className="hidden sm:flex items-center gap-3 pl-6 border-l border-white/10 text-gray-500">
                   <Volume2 size={18} />
-                  <input 
-                    type="range" 
-                    min="0" max="100" 
-                    value={localVolume}
-                    onChange={(e) => updateVolume(parseInt(e.target.value))}
-                    className="w-24 h-1 bg-white/10 rounded-full appearance-none cursor-pointer accent-[#ff7e5f]"
-                  />
+                  <input type="range" min={0} max={100} value={volume} aria-label="Volume"
+                    onChange={(e) => updateVolume(Number(e.target.value))}
+                    className="w-24 h-1 bg-white/10 rounded-full appearance-none cursor-pointer accent-accent" />
                 </div>
               </div>
-            </div>
-          </div>
-        </div>
 
-        {/* Chat & Participants */}
-        <div className="flex-1 flex gap-6 min-h-0">
-          {/* Chat */}
-          <div className="glass-card flex-1 flex flex-col min-h-0 rounded-[2rem]">
-            <div className="p-4 border-b border-white/5 flex items-center justify-between">
-              <h3 className="font-bold text-sm tracking-widest uppercase text-gray-500">Live Chat</h3>
-              <div className="flex -space-x-2">
-                {[1, 2, 3].map(i => (
-                  <div key={i} className="w-6 h-6 rounded-full border-2 border-[#0a0a0c] bg-gradient-to-br from-gray-700 to-gray-800" />
-                ))}
-              </div>
-            </div>
-            <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar">
-              {messages.map((msg, i) => {
-                const isMe = msg.user_id === currentUser?.id || msg.user_name === currentUser?.username;
-                return (
-                  <div key={i} className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
-                    <span className="text-[10px] text-gray-600 mb-1 px-1 font-bold uppercase tracking-wider">{msg.user_name || 'Listener'}</span>
-                    <div className={`px-4 py-2.5 rounded-2xl max-w-[85%] text-sm ${
-                      isMe 
-                        ? 'bg-gradient-to-r from-[#ff7e5f] to-[#feb47b] text-white shadow-lg shadow-[#ff7e5f]/10 rounded-tr-none' 
-                        : 'bg-white/5 text-gray-200 rounded-tl-none'
-                    }`}>
-                      {msg.content}
-                    </div>
-                  </div>
-                );
-              })}
-              <div ref={messagesEndRef} />
-            </div>
-            <div className="p-4 pt-0">
-              <form onSubmit={(e) => { e.preventDefault(); if (newMessage.trim()) { ws?.send(JSON.stringify({ type: 'chat_message', content: newMessage, user_id: currentUser?.id, user_name: currentUser?.username })); setNewMessage(''); }}} className="relative">
-                <input 
-                  type="text" 
-                  className="w-full bg-black/40 border border-white/10 rounded-2xl pl-4 pr-12 py-3.5 text-sm focus:ring-2 focus:ring-[#ff7e5f] outline-none"
-                  placeholder="Say something..."
-                  value={newMessage}
-                  onChange={(e) => setNewMessage(e.target.value)}
-                />
-                <button type="submit" className="absolute right-3 top-2.5 p-1 text-[#ff7e5f] hover:scale-110 transition-transform">
-                  <Send size={20} />
-                </button>
-              </form>
+              {currentUser.is_spotify_connected && !deviceId && !playerError && (
+                <p className="mt-4 text-xs text-yellow-500 flex items-center gap-2 justify-center md:justify-start">
+                  <Loader2 size={12} className="animate-spin" /> Starting your Spotify player…
+                </p>
+              )}
+              {playerError && <p className="mt-4 text-xs text-red-300">{playerError}</p>}
             </div>
           </div>
-        </div>
+        </section>
+
+        <section className="glass-card flex flex-col rounded-[2rem] h-[28rem]">
+          <div className="p-4 border-b border-white/5">
+            <h2 className="font-bold text-sm tracking-widest uppercase text-gray-400">Live chat</h2>
+          </div>
+          <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar" aria-live="polite">
+            {messages.length === 0 && <p className="text-center text-sm text-gray-500 py-8">No messages yet. Say hi 👋</p>}
+            {messages.map((msg, i) => {
+              const isMe = msg.user_id === currentUser.id;
+              return (
+                <div key={msg.id ?? `local-${i}`} className={`flex flex-col ${isMe ? 'items-end' : 'items-start'}`}>
+                  <span className="text-[10px] text-gray-500 mb-1 px-1 font-bold uppercase tracking-wider">
+                    {msg.user_name}{msg.user_id === room.admin && ' · host'}
+                  </span>
+                  <div className={`px-4 py-2.5 rounded-2xl max-w-[85%] text-sm break-words ${
+                    isMe ? 'bg-gradient-to-r from-accent to-accent-2 text-white rounded-tr-none' : 'bg-white/5 text-gray-200 rounded-tl-none'
+                  }`}>
+                    {msg.content}
+                  </div>
+                </div>
+              );
+            })}
+            <div ref={messagesEndRef} />
+          </div>
+          <form onSubmit={sendMessage} className="p-4 pt-0 relative">
+            <input className="input !rounded-2xl !pr-12" placeholder={connection === 'open' ? 'Say something…' : 'Connecting to chat…'}
+              value={newMessage} maxLength={1000} disabled={connection !== 'open'} aria-label="Chat message"
+              onChange={(e) => setNewMessage(e.target.value)} />
+            <button type="submit" disabled={connection !== 'open' || !newMessage.trim()}
+              className="absolute right-7 top-1/2 -translate-y-[calc(50%+0.5rem)] p-1 text-accent disabled:text-gray-600" aria-label="Send">
+              <Send size={20} />
+            </button>
+          </form>
+        </section>
       </div>
 
-      <style jsx global>{`
-        .glass-card {
-          background: rgba(255, 255, 255, 0.03);
-          backdrop-filter: blur(12px);
-          border: 1px solid rgba(255, 255, 255, 0.05);
-        }
-        .custom-scrollbar::-webkit-scrollbar {
-          width: 4px;
-        }
-        .custom-scrollbar::-webkit-scrollbar-track {
-          background: transparent;
-        }
-        .custom-scrollbar::-webkit-scrollbar-thumb {
-          background: rgba(255, 255, 255, 0.1);
-          border-radius: 20px;
-        }
-      `}</style>
+      {toast && (
+        <div role="status" className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 glass-card !bg-[#16171c]/95 px-5 py-3 rounded-2xl shadow-2xl text-sm flex items-center gap-3 max-w-[90vw]">
+          <span className="truncate">{toast}</span>
+          <button onClick={() => setToast('')} className="text-gray-500 hover:text-white" aria-label="Dismiss"><X size={14} /></button>
+        </div>
+      )}
     </div>
   );
 }

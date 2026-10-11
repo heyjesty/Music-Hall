@@ -1,81 +1,85 @@
 "use client";
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import api from '@/lib/api';
+import { Loader2 } from 'lucide-react';
+import api, { getErrorMessage } from '@/lib/api';
+import { isLoggedIn } from '@/lib/auth';
+import { THEMES, type Theme } from '@/lib/types';
+import { FormError } from '@/components/AuthCard';
 
 export default function CreateRoom() {
   const router = useRouter();
-  const [formData, setFormData] = useState({
+  const [formData, setFormData] = useState<{ name: string; theme: Theme; description: string }>({
     name: '',
     theme: 'CALM',
-    description: ''
+    description: '',
   });
-  const [loading, setLoading] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!isLoggedIn()) router.replace('/login?next=/rooms/create');
+  }, [router]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    setLoading(true);
+    setError('');
+    setSubmitting(true);
     try {
       const res = await api.post('rooms/', formData);
       router.push(`/rooms/${res.data.id}`);
     } catch (err) {
-      console.error(err);
-      alert("Failed to create room.");
-    } finally {
-      setLoading(false);
+      setError(getErrorMessage(err, 'Failed to create room.'));
+      setSubmitting(false);
     }
   };
 
   return (
-    <div className="max-w-2xl mx-auto py-12">
-      <div className="glass-card p-10 rounded-3xl">
-        <h1 className="text-4xl font-bold mb-8 text-gradient">Create a Room</h1>
-        
+    <div className="max-w-2xl mx-auto py-6 sm:py-12">
+      <div className="glass-card p-6 sm:p-10 rounded-3xl">
+        <h1 className="text-3xl sm:text-4xl font-bold text-gradient">Start a room</h1>
+        <p className="text-gray-400 text-sm mt-2 mb-8">You&apos;ll be the host — you control playback and the queue.</p>
+
         <form onSubmit={handleSubmit} className="space-y-6">
+          <FormError message={error} />
           <div>
-            <label className="block text-sm font-medium mb-2 text-gray-300">Room Name</label>
-            <input 
-              type="text" 
-              className="w-full bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-              value={formData.name}
-              onChange={e => setFormData({...formData, name: e.target.value})}
-              required
-              placeholder="e.g. Midnight Lofi"
-            />
+            <label htmlFor="name" className="block text-sm font-medium mb-2 text-gray-300">Room name</label>
+            <input id="name" className="input" value={formData.name} maxLength={255} required
+              placeholder="e.g. Midnight Lofi" onChange={(e) => setFormData({ ...formData, name: e.target.value })} />
           </div>
-          
+
+          <fieldset>
+            <legend className="block text-sm font-medium mb-2 text-gray-300">Mood</legend>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2">
+              {THEMES.map((t) => (
+                <button
+                  type="button"
+                  key={t.value}
+                  onClick={() => setFormData({ ...formData, theme: t.value })}
+                  aria-pressed={formData.theme === t.value}
+                  className={`px-3 py-3 rounded-xl border text-sm font-medium transition-colors ${
+                    formData.theme === t.value
+                      ? 'border-accent bg-accent/10 text-white'
+                      : 'border-white/10 text-gray-400 hover:border-white/30 hover:text-white'
+                  }`}
+                >
+                  <div className="text-xl mb-1">{t.emoji}</div>
+                  {t.label}
+                </button>
+              ))}
+            </div>
+          </fieldset>
+
           <div>
-            <label className="block text-sm font-medium mb-2 text-gray-300">Theme/Mood</label>
-            <select 
-              className="w-full bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-              value={formData.theme}
-              onChange={e => setFormData({...formData, theme: e.target.value})}
-            >
-              <option value="SAD">Sad</option>
-              <option value="ROMANTIC">Romantic</option>
-              <option value="ENERGETIC">Energetic</option>
-              <option value="CALM">Calm</option>
-              <option value="PARTY">Party</option>
-            </select>
-          </div>
-          
-          <div>
-            <label className="block text-sm font-medium mb-2 text-gray-300">Description</label>
-            <textarea 
-              className="w-full bg-black/30 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f] h-32 resize-none"
-              value={formData.description}
-              onChange={e => setFormData({...formData, description: e.target.value})}
+            <label htmlFor="description" className="block text-sm font-medium mb-2 text-gray-300">Description</label>
+            <textarea id="description" className="input h-32 resize-none" value={formData.description}
               placeholder="What kind of vibe is this room?"
-            />
+              onChange={(e) => setFormData({ ...formData, description: e.target.value })} />
           </div>
-          
-          <button 
-            type="submit" 
-            disabled={loading}
-            className="w-full py-4 mt-6 rounded-xl font-bold text-lg text-white bg-gradient-to-r from-[#ff7e5f] to-[#feb47b] hover:opacity-90 transition-opacity flex justify-center items-center"
-          >
-            {loading ? <div className="animate-spin rounded-full h-6 w-6 border-b-2 border-white"></div> : "Create & Enter Room"}
+
+          <button type="submit" disabled={submitting} className="btn-primary w-full !py-4 text-lg">
+            {submitting ? <Loader2 size={22} className="animate-spin" /> : 'Create & enter room'}
           </button>
         </form>
       </div>

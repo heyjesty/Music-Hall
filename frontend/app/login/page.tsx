@@ -1,68 +1,64 @@
 "use client";
 
-import { useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { Suspense, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
-import api from '@/lib/api';
+import { Loader2 } from 'lucide-react';
+import api, { getErrorMessage } from '@/lib/api';
+import { safeNext, setTokens } from '@/lib/auth';
+import AuthCard, { FormError } from '@/components/AuthCard';
 
-export default function Login() {
+function LoginForm() {
   const router = useRouter();
+  const searchParams = useSearchParams();
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
 
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
+    setError('');
+    setSubmitting(true);
     try {
       const res = await api.post('auth/login/', { username, password });
-      localStorage.setItem('access_token', res.data.access);
-      localStorage.setItem('refresh_token', res.data.refresh);
-      router.push('/');
+      setTokens(res.data.access, res.data.refresh);
+      router.push(safeNext(searchParams.get('next')));
     } catch (err) {
-      setError('Invalid credentials');
+      setError(getErrorMessage(err, 'Invalid username or password.'));
+      setSubmitting(false);
     }
   };
 
   return (
-    <div className="flex items-center justify-center min-h-[70vh]">
-      <div className="glass-card p-8 rounded-3xl w-full max-w-md">
-        <h2 className="text-3xl font-bold mb-6 text-center text-gradient">Welcome Back</h2>
-        {error && <p className="text-red-400 text-sm mb-4 text-center">{error}</p>}
-        
-        <form onSubmit={handleLogin} className="space-y-4">
-          <div>
-            <label className="block text-sm font-medium mb-1 text-gray-300">Username</label>
-            <input 
-              type="text" 
-              className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              required
-            />
-          </div>
-          <div>
-            <label className="block text-sm font-medium mb-1 text-gray-300">Password</label>
-            <input 
-              type="password" 
-              className="w-full bg-black/20 border border-white/10 rounded-xl px-4 py-3 text-white focus:outline-none focus:ring-2 focus:ring-[#ff7e5f]"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-            />
-          </div>
-          
-          <button 
-            type="submit" 
-            className="w-full py-3 mt-4 rounded-xl font-bold text-white bg-gradient-to-r from-[#ff7e5f] to-[#feb47b] hover:opacity-90 transition-opacity"
-          >
-            Sign In
-          </button>
-        </form>
-        
-        <p className="mt-6 text-center text-sm text-gray-400">
-          Don't have an account? <Link href="/signup" className="text-[#ff7e5f] hover:underline">Sign up</Link>
-        </p>
+    <form onSubmit={handleLogin} className="space-y-4">
+      <FormError message={error} />
+      <div>
+        <label htmlFor="username" className="block text-sm font-medium mb-1.5 text-gray-300">Username</label>
+        <input id="username" className="input" autoComplete="username" value={username}
+          onChange={(e) => setUsername(e.target.value)} required autoFocus />
       </div>
-    </div>
+      <div>
+        <label htmlFor="password" className="block text-sm font-medium mb-1.5 text-gray-300">Password</label>
+        <input id="password" type="password" className="input" autoComplete="current-password" value={password}
+          onChange={(e) => setPassword(e.target.value)} required />
+      </div>
+      <button type="submit" disabled={submitting} className="btn-primary w-full !mt-6">
+        {submitting && <Loader2 size={18} className="animate-spin" />} Sign in
+      </button>
+      <p className="pt-2 text-center text-sm text-gray-400">
+        New to Music Hall? <Link href="/signup" className="text-accent hover:underline">Create an account</Link>
+      </p>
+    </form>
+  );
+}
+
+export default function Login() {
+  return (
+    <AuthCard title="Welcome back" subtitle="Sign in to join the room.">
+      <Suspense fallback={null}>
+        <LoginForm />
+      </Suspense>
+    </AuthCard>
   );
 }
